@@ -3,7 +3,7 @@ and the metrics that judge them.
 
 A profile describes how a task is read and corrected:
 
-    {"permutations": 2, "label_style": "letters",
+    {"permutations": 2, "label_style": "letters", "layout": "inline",
      "questions": {"topic": {"temperature": 1.3, "bias": [0.1, -0.2, 0.0, 0.1]}},
      "default": {"temperature": 1.1}}
 
@@ -26,6 +26,7 @@ METHODS = ("temperature", "vector", "contextual")
 class Profile:
     permutations: int = 1
     label_style: str = "letters"
+    layout: str = "inline"  # see prompt.py
     questions: dict = field(default_factory=dict)
     default: dict | None = None
 

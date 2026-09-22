@@ -54,12 +54,13 @@ def test_rotation_maps_back(tiny):
     assert torch.allclose(avg, avg[0].expand(4), atol=1e-6)  # pure position bias averages out
 
 
-def test_name_labels(tiny):
-    planner = Planner(AutoTokenizer.from_pretrained(tiny))
-    plan = planner.plan("x", TOPIC, label_style="names")
+@pytest.mark.parametrize(("model", "layout"), [("tiny", "system"), ("small", "inline")])
+def test_name_labels(model, layout, request):
+    planner = Planner(AutoTokenizer.from_pretrained(request.getfixturevalue(model)))
+    plan = planner.plan("x", TOPIC, label_style="names", layout=layout)
     assert plan.labels[0] == ["sports", "business", "science", "world"]
     multi = {"c": {"type": "choice", "criteria": {"science and tech": None, "world news": None}}}
-    assert planner.plan("x", multi, label_style="names").labels[0] == ["A", "B"]  # falls back to letters
+    assert planner.plan("x", multi, label_style="names", layout=layout).labels[0] == ["A", "B"]  # letters fallback
 
 
 def test_lora_merge_matches_unmerged(tiny):
@@ -85,8 +86,18 @@ def test_train_lora_lowers_loss(tiny, tmp_path):
     ] * 2]
     runner = Runner(tiny, cache_bytes=0)
     planner = Planner(AutoTokenizer.from_pretrained(tiny))
-    losses = train_lora(runner, planner, rows, epochs=6, lr=2e-3, rank=4, alpha=8, batch_size=4, log=lambda *_: None)
-    assert sum(losses[-3:]) / 3 < sum(losses[:3]) / 3
+    names = list(TOPIC["topic"]["criteria"])
+
+    def dataset_loss():  # step losses are noisy (random rotations); judge the whole set
+        plans = [planner.plan(r["state"], TOPIC) for r in rows]
+        lps = [combine([p], [r])[0] for p, r in zip(plans, runner.read_many(plans))]
+        return -sum(lp[names.index(r["labels"]["topic"])] for lp, r in zip(lps, rows)).item() / len(rows)
+
+    before = dataset_loss()
+    # fixed option order: a 135M model cannot learn shuffled letter labels in 12 steps
+    train_lora(runner, planner, rows, epochs=6, lr=2e-3, rank=4, alpha=8, batch_size=4, log=lambda *_: None,
+               rotate=False)
+    assert dataset_loss() < before - 0.1
     lora.save(runner.model, tmp_path / "adapter")
     tuned = Runner(tiny, cache_bytes=0, adapter=tmp_path / "adapter")
     plan = planner.plan(rows[0]["state"], TOPIC)

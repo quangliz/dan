@@ -18,7 +18,7 @@ from dan import LLM
 from dan.calibration import Profile, apply, fit, metrics
 from dan.tuning import NULL_STATE, collect, load_rows
 
-SETTINGS = [("letters", 1), ("names", 1), ("letters", 2), ("letters", 4)]
+SETTINGS = [("letters", 1), ("names", 1), ("letters", 2), ("names", 2)]
 METHODS = ["temperature", "vector", "contextual"]
 
 
@@ -28,6 +28,7 @@ def main():
     p.add_argument("--data", default="data")
     p.add_argument("--sets", nargs="*", default=["ag_news", "sst2", "boolq"])
     p.add_argument("--adapter", default=None)
+    p.add_argument("--layout", choices=("inline", "system"), default="inline")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--out", default="report.md")
     p.add_argument("--threads", type=int, default=0)
@@ -35,7 +36,8 @@ def main():
     if args.threads:
         torch.set_num_threads(args.threads)
     llm = LLM(args.model, adapter=args.adapter)
-    lines = [f"# Calibration report: {args.model}" + (f" + {args.adapter}" if args.adapter else ""), "",
+    lines = [f"# Calibration report: {args.model}" + (f" + {args.adapter}" if args.adapter else "")
+             + f" ({args.layout} layout)", "",
              "| set | labels | rotations | method | acc | ECE | Brier | NLL | s/req |",
              "|---|---|---|---|---|---|---|---|---|"]
     results = []
@@ -46,7 +48,7 @@ def main():
         for style, k in SETTINGS:
             if not has_choice and (style == "names" or k > 2):
                 continue  # yes/no: labels are the same either way, and two rotations cover both orders
-            profile = Profile(k, style)
+            profile = Profile(k, style, args.layout)
             t = time.time()
             train = collect(llm, fit_rows, profile)
             test = collect(llm, eval_rows, profile)

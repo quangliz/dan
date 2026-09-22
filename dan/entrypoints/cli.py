@@ -64,8 +64,8 @@ def run_eval(args):
     from ..tuning import evaluate, load_rows
 
     profile = Profile.load(args.profile) if args.profile else None
-    if profile is None and (args.permutations > 1 or args.label_style != "letters"):
-        profile = Profile(args.permutations, args.label_style)
+    if profile is None and (args.permutations > 1 or args.label_style != "letters" or args.layout != "inline"):
+        profile = Profile(args.permutations, args.label_style, args.layout)
     report = evaluate(make_llm(args), load_rows(args.data)[: args.limit or None], profile)
     for key, m in report.items():
         print(f"{key:16s} {fmt(m)}")
@@ -78,7 +78,7 @@ def run_calibrate(args):
 
     eval_rows = load_rows(args.eval)[: args.limit or None] if args.eval else None
     profile, report = calibrate(make_llm(args), load_rows(args.data)[: args.limit or None], eval_rows,
-                                args.method, args.permutations, args.label_style)
+                                args.method, args.permutations, args.label_style, layout=args.layout)
     profile.save(args.out)
     print(f"wrote {args.out}")
     for key, r in report.items():
@@ -99,7 +99,7 @@ def run_train(args):
     runner = Runner(args.model, args.device, DTYPES[args.dtype], cache_bytes=0)
     planner = Planner(AutoTokenizer.from_pretrained(args.model))
     train_lora(runner, planner, load_rows(args.data)[: args.limit or None], args.epochs, args.lr, args.rank,
-               args.alpha, args.batch_size, args.loss, args.label_style)
+               args.alpha, args.batch_size, args.loss, args.label_style, layout=args.layout)
     lora.save(runner.model, args.out)
     print(f"wrote {args.out}")
 
@@ -137,6 +137,7 @@ def main(argv=None):
         c.add_argument("data", help="labeled JSONL")
         c.add_argument("--permutations", type=int, default=1, help="option rotations read and averaged")
         c.add_argument("--label-style", choices=("letters", "names"), default="letters")
+        c.add_argument("--layout", choices=("inline", "system"), default="inline")
         c.add_argument("--limit", type=int, default=0)
         c.add_argument("--json", action="store_true", help="also print the report as JSON")
         if name == "eval":
@@ -158,6 +159,7 @@ def main(argv=None):
     t.add_argument("--batch-size", type=int, default=8)
     t.add_argument("--loss", choices=("log", "brier"), default="log")
     t.add_argument("--label-style", choices=("letters", "names"), default="letters")
+    t.add_argument("--layout", choices=("inline", "system"), default="inline")
     t.add_argument("--limit", type=int, default=0)
     t.set_defaults(func=run_train)
 

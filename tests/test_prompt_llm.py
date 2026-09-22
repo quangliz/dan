@@ -14,17 +14,28 @@ QUESTIONS = {
 }
 
 
+@pytest.mark.parametrize("layout", ["inline", "system"])
 @pytest.mark.parametrize("model", ["tiny", "small"])
-def test_plan_slots_match_full_tokenization(model, request):
+def test_plan_slots_match_full_tokenization(model, layout, request):
     name = request.getfixturevalue(model)
     tok = AutoTokenizer.from_pretrained(name)
-    plan = Planner(tok).plan("Where is the train station?", QUESTIONS)
+    planner = Planner(tok)
+    state = "Where is the train station?"
+    plan = planner.plan(state, QUESTIONS, layout=layout)
     assert len(plan.branches) == 3
+    assert state in tok.decode(plan.prefix)
     for n, (b, labs) in enumerate(zip(plan.branches, plan.labels), 1):
         assert len(set(b.label_ids)) == len(labs)
         for lab, lid in zip(labs, b.label_ids):
-            text = tok.decode(plan.prefix + b.suffix + [lid])
-            assert text.endswith(f"q{n}: {lab}")
+            ids = plan.prefix + b.suffix + [lid]
+            text = tok.decode(ids)
+            if layout == "system":
+                assert text.endswith(f"q{n}: {lab}")
+            else:  # the branch holds its own question and the label ends the reply's first token
+                assert text.endswith(lab) and QUESTIONS[list(QUESTIONS)[n - 1]]["instructions"] in tok.decode(b.suffix)
+                spec = plan.specs[n - 1]
+                full = planner.prefix_ids(None, f"{state}\n\n{planner.question_text(spec, labs)}")
+                assert ids[:-1] == full  # trunk + branch is exactly the single-question prompt
 
 
 def test_choice_labels_scale(tiny):

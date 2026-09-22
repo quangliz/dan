@@ -51,12 +51,13 @@ def evaluate(llm, rows, profile=None, batch_size=16):
     return out
 
 
-def calibrate(llm, fit_rows, eval_rows=None, method="vector", permutations=1, label_style="letters", batch_size=16):
+def calibrate(llm, fit_rows, eval_rows=None, method="vector", permutations=1, label_style="letters", batch_size=16,
+              layout="inline"):
     """Fit a profile on ``fit_rows``; report raw vs calibrated metrics on
     ``eval_rows`` (if given). Returns (profile, report)."""
     if method not in METHODS:
         raise ValueError(f"unknown method {method!r}; use one of {METHODS}")
-    profile = Profile(permutations, label_style)
+    profile = Profile(permutations, label_style, layout)
     train = collect(llm, fit_rows, profile, batch_size)
     nulls = {}
     if method == "contextual":
@@ -79,7 +80,7 @@ def calibrate(llm, fit_rows, eval_rows=None, method="vector", permutations=1, la
 
 
 def train_lora(runner, planner, rows, epochs=1, lr=2e-4, rank=16, alpha=32, batch_size=8, loss="log",
-               label_style="letters", rotate=True, seed=0, log=print):
+               label_style="letters", rotate=True, seed=0, log=print, layout="inline"):
     """Fine-tune ``runner.model`` with LoRA on proper-scoring-rule losses over
     the label distributions, through the same read path used for serving.
     ``rotate`` reads each example under a random option rotation, so the
@@ -103,7 +104,7 @@ def train_lora(runner, planner, rows, epochs=1, lr=2e-4, rank=16, alpha=32, batc
             plans = []
             for r in batch:
                 rot = rng.randrange(1 << 16) if rotate else 0
-                plans.append(planner.plan(r["state"], r["questions"], rot % 64, 64, label_style))
+                plans.append(planner.plan(r["state"], r["questions"], rot % 64, 64, label_style, layout))
             reads = runner.forward(plans, use_cache=False)
             terms = []
             for r, plan, read in zip(batch, plans, reads):
