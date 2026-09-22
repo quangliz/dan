@@ -70,7 +70,7 @@ class Attention(nn.Module):
             self.k_norm = RMSNorm(head_dim, c.rms_norm_eps)
         self.qk_norm = qk_norm
 
-    def forward(self, x, cos, sin, mask):
+    def forward(self, x, cos, sin, segments, layer):
         n = x.shape[0]
         q = self.q_proj(x).view(n, self.h, self.d)
         k = self.k_proj(x).view(n, self.hkv, self.d)
@@ -79,7 +79,7 @@ class Attention(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
         q = rotate(q, cos[:, None], sin[:, None]).transpose(0, 1)
         k = rotate(k, cos[:, None], sin[:, None]).transpose(0, 1)
-        o = attend(q, k, v.transpose(0, 1), mask)
+        o = attend(q, k, v.transpose(0, 1), segments, layer)
         return self.o_proj(o.transpose(0, 1).reshape(n, self.h * self.d))
 
 
@@ -95,15 +95,16 @@ class MLP(nn.Module):
 
 
 class Layer(nn.Module):
-    def __init__(self, c, head_dim, qk_norm):
+    def __init__(self, c, head_dim, qk_norm, index):
         super().__init__()
+        self.index = index
         self.input_layernorm = RMSNorm(c.hidden_size, c.rms_norm_eps)
         self.self_attn = Attention(c, head_dim, qk_norm)
         self.post_attention_layernorm = RMSNorm(c.hidden_size, c.rms_norm_eps)
         self.mlp = MLP(c)
 
-    def forward(self, x, cos, sin, mask):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, mask)
+    def forward(self, x, cos, sin, segments):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, segments, self.index)
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
@@ -111,7 +112,7 @@ class Body(nn.Module):
     def __init__(self, c, head_dim, qk_norm):
         super().__init__()
         self.embed_tokens = nn.Embedding(c.vocab_size, c.hidden_size)
-        self.layers = nn.ModuleList(Layer(c, head_dim, qk_norm) for _ in range(c.num_hidden_layers))
+        self.layers = nn.ModuleList(Layer(c, head_dim, qk_norm, i) for i in range(c.num_hidden_layers))
         self.norm = RMSNorm(c.hidden_size, c.rms_norm_eps)
 
 
@@ -128,14 +129,15 @@ class LlamaForReads(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
         self.register_buffer("inv_freq", inv_frequencies(config, head_dim), persistent=False)
 
-    def hidden(self, ids, positions, mask):
-        """Final-normed hidden states for a packed token sequence."""
+    def hidden(self, ids, positions, segments):
+        """Final-normed hidden states for a packed token sequence whose
+        requests are ``segments`` (see ``attention.Segment``)."""
         ang = positions.float()[:, None] * self.inv_freq[None, :]
         ang = torch.cat((ang, ang), dim=-1)
         x = self.model.embed_tokens(ids)
         cos, sin = ang.cos().to(x.dtype), ang.sin().to(x.dtype)
         for layer in self.model.layers:
-            x = layer(x, cos, sin, mask)
+            x = layer(x, cos, sin, segments)
         return self.model.norm(x)
 
     def label_logits(self, h, label_ids):

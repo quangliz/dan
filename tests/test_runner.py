@@ -14,12 +14,10 @@ EXTRA = {"urgent": {"type": "noul", "instructions": "Is it urgent?", "criteria":
 
 
 def test_tree_mask():
-    req = torch.tensor([0, 0, 0, 0, 1, 1, 1])
-    br = torch.tensor([0, 0, 1, 2, 0, 1, 1])
-    m = tree_mask(req, br)
-    assert m[2].tolist() == [True, True, True, False, False, False, False]
-    assert m[3].tolist() == [True, True, False, True, False, False, False]
-    assert m[6].tolist() == [False, False, False, False, True, True, True]
+    m = tree_mask(torch.tensor([0, 0, 1, 1, 2]))
+    assert m[1].tolist() == [True, True, False, False, False]
+    assert m[3].tolist() == [True, True, True, True, False]
+    assert m[4].tolist() == [True, True, False, False, True]
 
 
 @pytest.mark.parametrize("model", ["tiny", "small"])
@@ -28,7 +26,14 @@ def test_parity_with_reference(model, request):
     planner = Planner(AutoTokenizer.from_pretrained(name))
     plans = [planner.plan(s, dict(QUESTIONS, **(EXTRA if i % 2 else {}))) for i, s in enumerate(STATES)]
     ref = HFReference(name)
-    got = Runner(name).read_many(plans)
-    for plan, logits in zip(plans, got):
-        for a, b in zip(logits, ref.read(plan)):
-            torch.testing.assert_close(a, b, atol=2e-3, rtol=1e-4)
+    expected = [ref.read(p) for p in plans]
+    runner = Runner(name)
+    # cold cache, then warm (static prefixes reused), then a mixed batch
+    for batch in (plans, plans, [plans[1], planner.plan("new state", QUESTIONS), plans[0]]):
+        got = runner.read_many(batch)
+        for plan, logits in zip(batch, got):
+            want = expected[plans.index(plan)] if plan in plans else ref.read(plan)
+            for a, b in zip(logits, want):
+                torch.testing.assert_close(a, b, atol=2e-3, rtol=1e-4)
+    assert runner.cache.hits >= len(plans) + 2
+    assert all(0 < p.static < len(p.prefix) for p in plans)

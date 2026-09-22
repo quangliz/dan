@@ -36,12 +36,14 @@ class ReadPlan:
     branches: list[Branch]
     forced: dict = field(default_factory=dict)
     order: list[str] = field(default_factory=list)  # question keys as the request listed them
+    static: int = 0  # leading prefix tokens that do not depend on the state (cacheable)
 
 
 class Planner:
     def __init__(self, tokenizer):
         self.tok = tokenizer
         self._slots = {}
+        self._static = {}
         self._supports_system = None
 
     def enc(self, text):
@@ -54,9 +56,27 @@ class Planner:
         # choose them against a probe prompt, then check them against the real one.
         probe = self.prefix_ids("", "")
         labels = [self.choose_labels(n + 1, s, probe[-TAIL:]) for n, s in enumerate(specs)]
-        prefix = self.prefix_ids(self.system_text(specs, labels), state_text) if specs else []
+        system = self.system_text(specs, labels)
+        prefix = self.prefix_ids(system, state_text) if specs else []
         branches = [self.branch(n + 1, labs, prefix[-TAIL:], s.key) for n, (s, labs) in enumerate(zip(specs, labels))]
-        return ReadPlan(prefix, specs, labels, branches, forced, list(questions))
+        static = self.static_len(system, prefix) if specs else 0
+        return ReadPlan(prefix, specs, labels, branches, forced, list(questions), static)
+
+    def static_len(self, system, prefix):
+        """How many leading prefix tokens are the same for any state: the
+        common prefix with an empty-state render of the same system text."""
+        probe = self._static.get(system)
+        if probe is None:
+            probe = self.prefix_ids(system, "")
+            if len(self._static) > 1024:
+                self._static.clear()
+            self._static[system] = probe
+        n = 0
+        for a, b in zip(prefix, probe):
+            if a != b:
+                break
+            n += 1
+        return min(n, len(prefix) - 1)  # keep at least one token computed fresh
 
     def choose_labels(self, n, spec, tail):
         k = len(spec.options)
