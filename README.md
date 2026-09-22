@@ -35,11 +35,11 @@ curl localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 
 ## How it works
 
-- The prompt is `[system: questions + labels] [user: state] [assistant header]`; each question is a
-  short branch `q<n>:` whose next token is read over that question's single-token labels.
+- The prompt's shared trunk holds the state; each question (with its options and the assistant header)
+  is its own branch, and the first reply token is read over that question's single-token labels.
 - All questions of all batched requests run in **one prefill**: projections/MLPs are batched over the
   packed tokens; attention runs per request under a tree mask (questions see the prompt, not each other).
-- The static prompt prefix (instructions + schema) is KV-cached and reused across requests.
+- The state-independent prompt prefix is KV-cached and reused across requests.
 - Only label logits are computed (`W_lm[label_ids] @ h`), never the full vocabulary.
 
 Supported architectures: Llama 2/3, Mistral, Qwen2/2.5/3, SmolLM.
@@ -70,3 +70,13 @@ dan serve Qwen/Qwen2.5-0.5B-Instruct --adapter adapter/   # merged into the weig
 ```
 
 Benchmark data and a full report: `benchmarks/make_datasets.py`, `benchmarks/calibration_report.py`.
+
+## Results (Qwen2.5-0.5B-Instruct, CPU, held-out accuracy / ECE)
+
+| set | raw | + vector profile | + LoRA + profile |
+|---|---|---|---|
+| AG News | 80.0% / 0.159 | 84.0% / 0.049 | 87.5% / 0.074 |
+| SST-2 | 88.5% / 0.120 | 89.5% / 0.053 | – |
+| BoolQ | 65.5% / 0.167 | 67.0% / 0.059 | 74.0% / 0.095 |
+
+Details and takeaways: [benchmarks/results](benchmarks/results/README.md).
