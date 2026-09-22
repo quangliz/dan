@@ -10,7 +10,7 @@ Label selection and slot checks are adapted from OpenJev (Apache-2.0).
 """
 import json
 import string
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .schema import SchemaError, Spec, parse_questions
 
@@ -37,6 +37,17 @@ class ReadPlan:
     forced: dict = field(default_factory=dict)
     order: list[str] = field(default_factory=list)  # question keys as the request listed them
     static: int = 0  # leading prefix tokens that do not depend on the state (cacheable)
+    perms: list[list[int]] = field(default_factory=list)  # per question: option index shown at each position
+
+
+ROTATABLE = ("choice", "noul")  # score levels are ordered; their order is meaning, not bias
+
+
+def rotation_perm(spec, rotation, rotations):
+    """Rotation ``rotation`` of ``rotations``, spread evenly over the options."""
+    k = len(spec.options)
+    r = (rotation * k) // rotations if spec.type in ROTATABLE else 0
+    return [(i + r) % k for i in range(k)]
 
 
 class Planner:
@@ -49,18 +60,35 @@ class Planner:
     def enc(self, text):
         return self.tok.encode(text, add_special_tokens=False)
 
-    def plan(self, state, questions):
+    def plans(self, state, questions, profile=None):
+        """The reads one request takes under ``profile``: one per option
+        rotation (at most as many as the largest option list)."""
+        style = profile.label_style if profile else "letters"
+        n = profile.permutations if profile else 1
+        first = self.plan(state, questions, 0, n, style)
+        n = min(n, max([len(s.options) for s in first.specs if s.type in ROTATABLE], default=1))
+        return [first] + [self.plan(state, questions, r, n, style) for r in range(1, n)]
+
+    def plan(self, state, questions, rotation=0, rotations=1, label_style="letters"):
+        """``rotation`` of ``rotations`` shifts the listed order of choice and
+        yes/no options, so reads can be averaged against position bias.
+        ``label_style``: "letters" (A, B, ...) or "names" (a choice's own option
+        names when each is one distinct token, else letters)."""
+        if label_style not in ("letters", "names"):
+            raise ValueError(f"unknown label style {label_style!r}")
         specs, forced = parse_questions(questions)
         state_text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+        perms = [rotation_perm(s, rotation, rotations) for s in specs]
+        shown = [replace(s, options=[s.options[i] for i in perm]) for s, perm in zip(specs, perms)]
         # Labels depend only on the assistant header, which is fixed per model:
         # choose them against a probe prompt, then check them against the real one.
         probe = self.prefix_ids("", "")
-        labels = [self.choose_labels(n + 1, s, probe[-TAIL:]) for n, s in enumerate(specs)]
-        system = self.system_text(specs, labels)
+        labels = [self.choose_labels(n + 1, s, probe[-TAIL:], label_style) for n, s in enumerate(shown)]
+        system = self.system_text(shown, labels)
         prefix = self.prefix_ids(system, state_text) if specs else []
         branches = [self.branch(n + 1, labs, prefix[-TAIL:], s.key) for n, (s, labs) in enumerate(zip(specs, labels))]
         static = self.static_len(system, prefix) if specs else 0
-        return ReadPlan(prefix, specs, labels, branches, forced, list(questions), static)
+        return ReadPlan(prefix, specs, labels, branches, forced, list(questions), static, perms)
 
     def static_len(self, system, prefix):
         """How many leading prefix tokens are the same for any state: the
@@ -78,13 +106,19 @@ class Planner:
             n += 1
         return min(n, len(prefix) - 1)  # keep at least one token computed fresh
 
-    def choose_labels(self, n, spec, tail):
+    def choose_labels(self, n, spec, tail, label_style="letters"):
+        """Labels for ``spec``'s options in the order they are shown."""
         k = len(spec.options)
         if spec.type == "noul":
-            sets = NOUL_LABELS
+            names = [name for name, _ in spec.options]
+            sets = [[{"yes": y, "no": no}[x] for x in names] for y, no in NOUL_LABELS]
         elif spec.type == "score":
             sets = [DIGITS[:k], LETTERS[:k]]
         else:
+            if label_style == "names":
+                names = [name for name, _ in spec.options]
+                if self.pick(n, names, k, tail) is not None:
+                    return names
             got = self.pick(n, CHOICE_POOL, k, tail)
             if got is None:
                 raise SchemaError(f"this model's tokenizer has too few single-token labels for {k} choices",
@@ -138,7 +172,7 @@ class Planner:
         for n, (spec, labs) in enumerate(zip(specs, labels), 1):
             s += f"\nQuestion q{n}: {spec.instructions or 'Answer about the state.'}\n"
             for (name, desc), lab in zip(spec.options, labs):
-                if spec.type == "choice":
+                if spec.type == "choice" and lab != name:
                     s += f"  {lab}: {name} ({desc})\n" if desc else f"  {lab}: {name}\n"
                 else:
                     s += f"  {lab}: {desc}\n" if desc else f"  {lab}\n"

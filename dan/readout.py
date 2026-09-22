@@ -1,5 +1,13 @@
-"""Label logits -> Jev answers."""
+"""Label logits -> Jev answers.
+
+A request may be read under several option rotations (see
+``Planner.plan``). Each read's label logits are put back in canonical option
+order and turned into log-probabilities; the reads are averaged in log space,
+a calibration profile (if any) adjusts the result, and that becomes the answer.
+"""
 import math
+
+import torch
 
 
 def softmax(xs):
@@ -27,9 +35,34 @@ def to_answer(spec, p):
             "probabilities": {str(i): v for i, v in enumerate(p)}, "confidence": confidence(p)}
 
 
-def answers(plan, label_logits):
-    """``label_logits``: per branch, the logits of that question's label tokens."""
+def canonical(plan, label_logits):
+    """Per question, log-probabilities in canonical option order."""
+    out = []
+    for perm, lg in zip(plan.perms or [None] * len(plan.specs), label_logits):
+        lg = torch.as_tensor(lg).float()
+        if perm is not None:  # shown position i holds option perm[i]; invert (differentiably)
+            inv = [0] * len(perm)
+            for i, o in enumerate(perm):
+                inv[o] = i
+            lg = lg[torch.tensor(inv, device=lg.device)]
+        out.append(torch.log_softmax(lg, dim=0))
+    return out
+
+
+def combine(plans, reads):
+    """Average each question's log-probabilities over reads of the same
+    request under different rotations."""
+    per = [canonical(p, r) for p, r in zip(plans, reads)]
+    return [torch.stack(qs).mean(0) for qs in zip(*per)] if per else []
+
+
+def answers(plan, label_logits, profile=None, logits_canonical=False):
+    """``label_logits``: per question, the logits of its label tokens (as read,
+    unless ``logits_canonical``)."""
     out = dict(plan.forced)
-    for spec, logits in zip(plan.specs, label_logits):
-        out[spec.key] = to_answer(spec, softmax([float(x) for x in logits]))
+    logits = label_logits if logits_canonical else canonical(plan, label_logits)
+    for spec, lg in zip(plan.specs, logits):
+        if profile is not None:
+            lg = profile.adjust(spec.key, lg)
+        out[spec.key] = to_answer(spec, softmax([float(x) for x in lg]))
     return {k: out[k] for k in plan.order}

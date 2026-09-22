@@ -43,3 +43,30 @@ curl localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 - Only label logits are computed (`W_lm[label_ids] @ h`), never the full vocabulary.
 
 Supported architectures: Llama 2/3, Mistral, Qwen2/2.5/3, SmolLM.
+
+## Calibration
+
+Probabilities from an off-the-shelf instruct model are usually over-confident and biased toward
+some option positions. dan fixes this per task with a **profile**, fitted on labeled data:
+
+```bash
+# labeled JSONL: {"state": ..., "questions": {...}, "labels": {"topic": "sports"}}
+dan calibrate Qwen/Qwen2.5-0.5B-Instruct fit.jsonl --eval eval.jsonl --method vector \
+    --permutations 2 --out topic.json          # prints accuracy / ECE / Brier / NLL, raw vs calibrated
+dan eval Qwen/Qwen2.5-0.5B-Instruct eval.jsonl --profile topic.json
+dan serve Qwen/Qwen2.5-0.5B-Instruct --profile topic=topic.json   # request model "dan-latest@topic"
+```
+
+- `--permutations k` reads k rotations of the option order and averages them (against position bias).
+- `--label-style names` uses option names as labels when each is a single token (else letters).
+- Methods: `temperature` (one T), `vector` (T + per-option bias), `contextual` (bias from a null state, then T).
+
+For a stronger fix, fine-tune a LoRA adapter with a proper scoring rule through the same read path
+(options are rotated randomly during training so the adapter learns content, not positions):
+
+```bash
+dan train Qwen/Qwen2.5-0.5B-Instruct fit.jsonl --out adapter/ --loss log --epochs 1
+dan serve Qwen/Qwen2.5-0.5B-Instruct --adapter adapter/   # merged into the weights: no serving overhead
+```
+
+Benchmark data and a full report: `benchmarks/make_datasets.py`, `benchmarks/calibration_report.py`.

@@ -10,7 +10,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-from .readout import answers
+from .readout import answers, combine
 
 
 class Overloaded(RuntimeError):
@@ -52,17 +52,24 @@ class AsyncEngine:
                 pass
             self._worker = None
 
-    async def decide(self, state, questions):
-        """Answers keyed by question id, and the input tokens the read took."""
-        plan = self.planner.plan(state, questions)  # raises SchemaError on bad requests
-        if not plan.branches:
-            return answers(plan, []), 0
-        if self.queue.qsize() >= self.max_queue:
+    async def decide(self, state, questions, profile=None):
+        """Answers keyed by question id, and the input tokens the reads took.
+        A profile's rotations are separate reads, batched like any others."""
+        plans = self.planner.plans(state, questions, profile)  # raises SchemaError on bad requests
+        if not plans[0].branches:
+            return answers(plans[0], []), 0
+        if self.queue.qsize() + len(plans) > self.max_queue:
             raise Overloaded("dan is at capacity. Retry shortly.")
         self.start()
-        fut = asyncio.get_running_loop().create_future()
-        await self.queue.put((plan, fut, time.perf_counter()))
-        return await fut
+        loop, t0 = asyncio.get_running_loop(), time.perf_counter()
+        futs = [loop.create_future() for _ in plans]
+        for plan, fut in zip(plans, futs):
+            await self.queue.put((plan, fut, t0))
+        reads = await asyncio.gather(*futs)
+        self.stats.requests += 1
+        self.stats.latency_s += time.perf_counter() - t0
+        logp = combine(plans, reads)
+        return answers(plans[0], logp, profile, logits_canonical=True), sum(self.cost(p) for p in plans)
 
     @staticmethod
     def cost(plan):
@@ -98,12 +105,9 @@ class AsyncEngine:
                 if not fut.done():
                     fut.set_exception(e)
             return
-        done = time.perf_counter()
         self.stats.batches += 1
         self.stats.tokens += tokens
-        self.stats.busy_s += done - t
-        for (plan, fut, t0), lg in zip(batch, logits):
-            self.stats.requests += 1
-            self.stats.latency_s += done - t0
+        self.stats.busy_s += time.perf_counter() - t
+        for (_, fut, _), lg in zip(batch, logits):
             if not fut.done():
-                fut.set_result((answers(plan, lg), self.cost(plan)))
+                fut.set_result(lg)

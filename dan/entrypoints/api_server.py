@@ -8,7 +8,7 @@ import hmac
 import logging
 import secrets
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -30,6 +30,7 @@ class ServerSettings:
     model: str
     served_name: str = "dan-latest"
     api_key: str = ""
+    profiles: dict = field(default_factory=dict)  # name -> calibration.Profile, requested as "<model>@<name>"
 
 
 class SystemOneRequest(BaseModel):
@@ -109,23 +110,28 @@ def create_app(settings, engine: AsyncEngine):
 
     @app.get("/v1/models")
     async def models():
-        return {"models": [{"name": n, "description": f"dan {__version__} serving {settings.model}"}
-                           for n in [settings.served_name, *JEV_ALIASES]]}
+        desc = f"dan {__version__} serving {settings.model}"
+        return {"models": [{"name": n, "description": desc} for n in [settings.served_name, *JEV_ALIASES]]
+                + [{"name": f"{settings.served_name}@{p}", "description": f"{desc}, calibration profile {p!r}"}
+                   for p in settings.profiles]}
 
     @app.post("/v1/systemone")
     async def systemone(req: SystemOneRequest):
-        if req.model not in names:
+        base, _, profile_name = req.model.partition("@")
+        if base not in names or (profile_name and profile_name not in settings.profiles):
             return error(400, "api_usage_error", f"Unknown model: {req.model}")
+        profile = settings.profiles.get(profile_name) if profile_name else None
         for opt in ("images", "think", "sequential"):
             if getattr(req, opt):
                 return JSONResponse({"detail": f"{opt} is not supported by dan yet"}, status_code=400)
         try:
-            answers, tokens = await engine.decide(req.state, {k: q.model_dump() for k, q in req.questions.items()})
+            answers, tokens = await engine.decide(req.state, {k: q.model_dump() for k, q in req.questions.items()},
+                                                  profile)
         except SchemaError as e:
             return JSONResponse({"detail": str(e)}, status_code=400)
         except Overloaded as e:
             return error(529, "overloaded_error", str(e), {"retry-after": "1"})
-        return {"model": req.model if req.model == settings.served_name else settings.served_name,
+        return {"model": settings.served_name + (f"@{profile_name}" if profile_name else ""),
                 "answers": answers, "usage": {"input_tokens": tokens, "output_tokens": 0}}
 
     @app.get("/metrics", response_class=PlainTextResponse)
