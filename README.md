@@ -48,6 +48,9 @@ Server (Jev-compatible: TypeSafe's SDKs work with `TYPESAFE_BASE_URL=http://127.
 
 ```bash
 dan serve Qwen/Qwen3.5-4B --port 8000        # CUDA + bf16 when available
+```
+
+```bash
 curl localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
   "model": "dan-latest", "state": "where is my parcel?",
   "questions": {"urgent": {"type": "noul", "instructions": "Is this urgent?"}}}'
