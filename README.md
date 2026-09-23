@@ -42,7 +42,8 @@ curl localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 - The state-independent prompt prefix is KV-cached and reused across requests.
 - Only label logits are computed (`W_lm[label_ids] @ h`), never the full vocabulary.
 
-Supported architectures: Llama 2/3, Mistral, Qwen2/2.5/3, SmolLM.
+Supported architectures: Llama 2/3, Mistral, Qwen2/2.5/3, SmolLM, and Qwen3.5 (hybrid Gated DeltaNet +
+attention: question branches start from the trunk's recurrent state). `--quantization fp8` needs sm89+.
 
 ## Calibration
 
