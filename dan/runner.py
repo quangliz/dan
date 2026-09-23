@@ -15,12 +15,19 @@ from .models import load
 
 
 class Runner:
-    def __init__(self, model, device="cpu", dtype=torch.float32, cache_bytes=2 << 30, adapter=None):
+    def __init__(self, model, device="cpu", dtype=torch.float32, cache_bytes=2 << 30, adapter=None,
+                 quantization=None):
         self.model = load(model, device, dtype)
         if adapter:
             from .lora import load_merged
 
             load_merged(self.model, adapter)
+        if quantization == "fp8":
+            from .quant import quantize_fp8
+
+            quantize_fp8(self.model)
+        elif quantization:
+            raise ValueError(f"unknown quantization {quantization!r}; use 'fp8'")
         self.device = device
         self.cache = PrefixCache(cache_bytes) if cache_bytes else None
 
@@ -46,7 +53,7 @@ class Runner:
                 branch += [j] * len(b.suffix)
                 reads.append((len(ids) - 1, b.label_ids))
             save = plan.static if use_cache and static and not past else 0
-            segs.append(segment(start, torch.tensor(branch, device=self.device), past, save, skip))
+            segs.append(segment(start, branch, past, save, skip, self.device))
             if save:
                 stores.append((static, segs[-1]))
         t = lambda xs: torch.tensor(xs, dtype=torch.long, device=self.device)

@@ -11,10 +11,11 @@ from ..readout import answers, combine
 
 
 class LLM:
-    def __init__(self, model, device="cpu", dtype=torch.float32, backend="dan", adapter=None):
+    def __init__(self, model, device="cpu", dtype=torch.float32, backend="dan", adapter=None, quantization=None):
         """``backend``: "dan" (own packed tree-mask runner) or "reference"
         (a Hugging Face forward per question; the correctness oracle).
-        ``adapter``: a LoRA adapter directory from ``dan train`` (dan backend)."""
+        ``adapter``: a LoRA adapter directory from ``dan train`` (dan backend).
+        ``quantization``: "fp8" for FP8 decoder weights and activations (sm89+)."""
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(model)
@@ -22,10 +23,10 @@ class LLM:
         if backend == "dan":
             from ..runner import Runner
 
-            self.runner = Runner(model, device, dtype, adapter=adapter)
+            self.runner = Runner(model, device, dtype, adapter=adapter, quantization=quantization)
         elif backend == "reference":
-            if adapter:
-                raise ValueError("adapters need the dan backend")
+            if adapter or quantization:
+                raise ValueError("adapters and quantization need the dan backend")
             from ..reference import HFReference
 
             self.runner = HFReference(model, device, dtype)

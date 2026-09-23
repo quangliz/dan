@@ -22,7 +22,7 @@ def build_engine(args):
     from ..runner import Runner
 
     runner = Runner(args.model, args.device, DTYPES[args.dtype], cache_bytes=int(args.prefix_cache_gb * (1 << 30)),
-                    adapter=args.adapter)
+                    adapter=args.adapter, quantization=args.quantization)
     return AsyncEngine(Planner(AutoTokenizer.from_pretrained(args.model)), runner,
                        max_batch_tokens=args.max_batch_tokens, max_wait_ms=args.max_wait_ms, max_queue=args.max_queue)
 
@@ -52,7 +52,7 @@ def serve(args):
 def make_llm(args):
     from .llm import LLM
 
-    return LLM(args.model, args.device, DTYPES[args.dtype], adapter=args.adapter)
+    return LLM(args.model, args.device, DTYPES[args.dtype], adapter=args.adapter, quantization=args.quantization)
 
 
 def fmt(m):
@@ -111,6 +111,7 @@ def model_args(p, adapter=True):
     p.add_argument("--threads", type=int, default=0, help="CPU threads for torch (0 = default)")
     if adapter:
         p.add_argument("--adapter", default=None, help="LoRA adapter directory from `dan train`")
+        p.add_argument("--quantization", choices=("fp8",), default=None, help="FP8 weights+activations (sm89+)")
 
 
 def main(argv=None):

@@ -23,12 +23,39 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..attention import attend
+from ..attention import attend, cu_seqlens, repeat_heads
 
 try:  # GPU kernels (pip install flash-linear-attention)
+    import fla.ops.gated_delta_rule.chunk as fla_chunk
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
 except ImportError:  # pragma: no cover - CPU / not installed
-    fla_chunk_gated_delta_rule = None
+    fla_chunk = fla_chunk_gated_delta_rule = None
+
+
+def _memoize_fla_chunk_indices():
+    """fla rebuilds varlen chunk indices on the host and uploads them on every
+    call (a stream sync), caching only the latest call's arguments; trunk and
+    branch calls alternate in every layer, so it always misses. Memoize by
+    the host-side lengths instead: at most one upload per distinct batch shape."""
+    original = fla_chunk.prepare_chunk_indices
+    memo = {}
+
+    def prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=None):
+        if cu_seqlens_cpu is None:
+            return original(cu_seqlens, chunk_size)
+        key = (tuple(cu_seqlens_cpu.tolist()), chunk_size, cu_seqlens.device)
+        hit = memo.get(key)
+        if hit is None:
+            if len(memo) > 4096:
+                memo.clear()
+            hit = memo[key] = original(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu)
+        return hit
+
+    fla_chunk.prepare_chunk_indices = prepare_chunk_indices
+
+
+if fla_chunk is not None:
+    _memoize_fla_chunk_indices()
 
 
 def text_config(config):
@@ -105,10 +132,10 @@ def delta_rule(q, k, v, g, beta, lengths, states):
     each starting from its ``states[i]`` ([S, H, Dk, Dv] fp32). Returns the
     packed output and the final states."""
     if fla_chunk_gated_delta_rule is not None and q.is_cuda:
-        cu = torch.tensor([0, *lengths], device=q.device).cumsum(0)
+        cu, cu_host = cu_seqlens(lengths, q.device)
         out, final = fla_chunk_gated_delta_rule(
             q[None], k[None], v[None], g[None], beta[None], initial_state=states.float(),
-            output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
+            output_final_state=True, cu_seqlens=cu, cu_seqlens_cpu=cu_host, use_qk_l2norm_in_kernel=True)
         return out[0], final
     outs, finals, i = [], [], 0
     for n, s in zip(lengths, states):
@@ -220,8 +247,7 @@ class DeltaNet(nn.Module):
         q, k, v = conv.split([key_dim, key_dim, self.hv * self.dv], dim=-1)
         n = conv.shape[0]
         q, k, v = q.reshape(n, self.hk, self.dk), k.reshape(n, self.hk, self.dk), v.reshape(n, self.hv, self.dv)
-        if self.hv > self.hk:
-            q, k = q.repeat_interleave(self.hv // self.hk, 1), k.repeat_interleave(self.hv // self.hk, 1)
+        q, k = repeat_heads(q, self.hv // self.hk), repeat_heads(k, self.hv // self.hk)
         rows = torch.cat([torch.arange(sl.start, sl.stop, device=conv.device) for _, sl in runs])
         return delta_rule(q, k, v, g[rows], beta[rows], lens, states)
 
