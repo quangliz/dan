@@ -4,3 +4,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 data/
+# local only: Colab helpers, benchmark scripts and results
+scripts/
+benchmarks/

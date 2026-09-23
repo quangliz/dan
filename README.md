@@ -69,15 +69,3 @@ For a stronger fix, fine-tune a LoRA adapter with a proper scoring rule through 
 dan train Qwen/Qwen2.5-0.5B-Instruct fit.jsonl --out adapter/ --loss log --epochs 1
 dan serve Qwen/Qwen2.5-0.5B-Instruct --adapter adapter/   # merged into the weights: no serving overhead
 ```
-
-Benchmark data and a full report: `benchmarks/make_datasets.py`, `benchmarks/calibration_report.py`.
-
-## Results (Qwen2.5-0.5B-Instruct, CPU, held-out accuracy / ECE)
-
-| set | raw | + vector profile | + LoRA + profile |
-|---|---|---|---|
-| AG News | 80.0% / 0.159 | 84.0% / 0.049 | 87.5% / 0.074 |
-| SST-2 | 88.5% / 0.120 | 89.5% / 0.053 | – |
-| BoolQ | 65.5% / 0.167 | 67.0% / 0.059 | 74.0% / 0.095 |
-
-Details and takeaways: [benchmarks/results](benchmarks/results/README.md).
