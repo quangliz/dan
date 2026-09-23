@@ -96,7 +96,7 @@ class Planner:
         system = layout == "system"
         # Labels depend only on the assistant header, which is fixed per model:
         # choose them against a probe prompt, then check them against the real one.
-        tail = self.prefix_ids("" if system else None, "")[-TAIL:]
+        tail = self.cached_ids("" if system else None, "")[-TAIL:]
         leads = [f"q{n + 1}: " if system else "" for n in range(len(specs))]
         labels = [self.choose_labels(s, tail, label_style, lead) for s, lead in zip(shown, leads)]
         if system:
@@ -106,9 +106,12 @@ class Planner:
                         for s, labs, lead in zip(specs, labels, leads)]
             static = self.common(prefix, self.cached_ids(text, ""))
         else:
-            fulls = [self.prefix_ids(None, f"{state_text}\n\n{self.question_text(s, labs)}")
-                     for s, labs in zip(shown, labels)]
+            users = [f"{state_text}\n\n{self.question_text(s, labs)}" for s, labs in zip(shown, labels)]
+            first = self.prefix_ids(None, users[0])
             probe = self.prefix_ids(None, f"{state_text}\n\n#")  # where any question would start
+            trunk = first[:self.common(first, probe)]
+            head = self.tok.decode(trunk)
+            fulls = [first] + [self.after_trunk(trunk, head, u) for u in users[1:]]
             n = min(self.common(f, probe) for f in fulls)
             prefix = fulls[0][:n]
             branches = []
@@ -118,6 +121,15 @@ class Planner:
             static = self.common(prefix, self.cached_ids(None, ""))
         return ReadPlan(prefix, specs, labels, branches, forced, list(questions),
                         min(static, len(prefix) - 1), perms)  # keep one trunk token computed fresh
+
+    def after_trunk(self, trunk, head, user):
+        """The full prompt ids for ``user``, given that it shares ``trunk``
+        (whose text is ``head``): only the text after the trunk is tokenized,
+        against the trunk's last tokens. Falls back to tokenizing it all."""
+        text = self.prompt_text(None, user)
+        if not text.startswith(head):
+            return self.prefix_ids(None, user)
+        return trunk + self.continuation(trunk[-TAIL:], text[len(head):])
 
     def cached_ids(self, system, user):
         key = (system, user)
@@ -224,9 +236,17 @@ class Planner:
             s += self.option_lines(spec, labs)
         return s + '\nAnswer each question on its own line formatted as "id: label". Lines may come in any order.'
 
+    def prompt_text(self, system, user):
+        return self.render(system, user, tokenize=False)
+
     def prefix_ids(self, system, user):
         """Chat-template token ids ending with the assistant header; no system
         message when ``system`` is None."""
+        out = self.render(system, user, tokenize=True)
+        ids = out["input_ids"] if hasattr(out, "keys") else out
+        return [int(t) for t in ids]
+
+    def render(self, system, user, tokenize):
         if system is None:
             msgs = [{"role": "user", "content": user}]
         elif self._supports_system is False:
@@ -234,13 +254,12 @@ class Planner:
         else:
             msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         try:
-            out = self.tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True,
+            out = self.tok.apply_chat_template(msgs, tokenize=tokenize, add_generation_prompt=True,
                                                enable_thinking=False)
             self._supports_system = self._supports_system if self._supports_system is not None else True
         except Exception:
             if self._supports_system is not None:
                 raise
             self._supports_system = False  # e.g. Gemma 2: no system role
-            return self.prefix_ids(system, user)
-        ids = out["input_ids"] if hasattr(out, "keys") else out
-        return [int(t) for t in ids]
+            return self.render(system, user, tokenize)
+        return out

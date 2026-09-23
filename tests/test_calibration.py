@@ -66,7 +66,7 @@ def test_name_labels(model, layout, request):
 def test_lora_merge_matches_unmerged(tiny):
     planner = Planner(AutoTokenizer.from_pretrained(tiny))
     plans = [planner.plan("Where is the station?", QUESTIONS)]
-    runner = Runner(tiny, cache_bytes=0)
+    runner = Runner(tiny, cache_bytes=0, merge_projections=False)
     lora.inject(runner.model, rank=4, alpha=8)
     torch.manual_seed(0)
     for m in runner.model.modules():
@@ -84,7 +84,7 @@ def test_train_lora_lowers_loss(tiny, tmp_path):
         ("The striker scored twice in the final.", "sports"), ("Shares fell after weak earnings.", "business"),
         ("Researchers sequenced the genome of a fern.", "science"), ("The summit ended without a treaty.", "world"),
     ] * 2]
-    runner = Runner(tiny, cache_bytes=0)
+    runner = Runner(tiny, cache_bytes=0, merge_projections=False)
     planner = Planner(AutoTokenizer.from_pretrained(tiny))
     names = list(TOPIC["topic"]["criteria"])
 

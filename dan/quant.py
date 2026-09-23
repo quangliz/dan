@@ -10,6 +10,8 @@ model dtype: they are gathers, not matmuls, on the read path.
 import torch
 from torch import nn
 
+from .fused import fp8_quantize
+
 E4M3 = torch.float8_e4m3fn
 E4M3_MAX = torch.finfo(E4M3).max
 
@@ -34,13 +36,7 @@ class FP8Linear(nn.Module):
 
     def forward(self, x):
         shape = x.shape
-        x = x.reshape(-1, shape[-1])
-        if self.rowwise:
-            amax = x.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-12)  # [tokens, 1]
-        else:
-            amax = x.abs().amax().float().clamp(min=1e-12).reshape(1, 1)
-        scale = amax / E4M3_MAX
-        xq = (x.float() / scale).to(E4M3)
+        xq, scale = fp8_quantize(x.reshape(-1, shape[-1]), E4M3_MAX, self.rowwise)
         y = torch._scaled_mm(xq, self.weight.t(), scale_a=scale, scale_b=self.weight_scale,
                              bias=self.bias, out_dtype=self.out_dtype)
         return y.reshape(*shape[:-1], self.out_features)

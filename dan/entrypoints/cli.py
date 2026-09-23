@@ -96,7 +96,7 @@ def run_train(args):
     from ..runner import Runner
     from ..tuning import load_rows, train_lora
 
-    runner = Runner(args.model, args.device, DTYPES[args.dtype], cache_bytes=0)
+    runner = Runner(args.model, args.device, DTYPES[args.dtype], cache_bytes=0, merge_projections=False)
     planner = Planner(AutoTokenizer.from_pretrained(args.model))
     train_lora(runner, planner, load_rows(args.data)[: args.limit or None], args.epochs, args.lr, args.rank,
                args.alpha, args.batch_size, args.loss, args.label_style, layout=args.layout)

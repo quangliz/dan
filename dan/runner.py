@@ -16,12 +16,16 @@ from .models import load
 
 class Runner:
     def __init__(self, model, device="cpu", dtype=torch.float32, cache_bytes=2 << 30, adapter=None,
-                 quantization=None):
+                 quantization=None, merge_projections=True):
+        """``merge_projections``: serve-time fusion of projections that share an
+        input; training (LoRA on the separate projections) passes False."""
         self.model = load(model, device, dtype)
         if adapter:
             from .lora import load_merged
 
             load_merged(self.model, adapter)
+        if merge_projections:
+            self.model.merge_projections()
         if quantization == "fp8":
             from .quant import quantize_fp8
 

@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..attention import attend, cu_seqlens, repeat_heads
+from ..fused import delta_gates, gated_rms_norm, rms_norm_zero_centered, rotate_partial, sigmoid_gate, swiglu
+from .common import merge_linears
 
 try:  # GPU kernels (pip install flash-linear-attention)
     import fla.ops.gated_delta_rule.chunk as fla_chunk
@@ -71,9 +73,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        y = x.float()
-        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (y * (1.0 + self.weight.float())).type_as(x)
+        return rms_norm_zero_centered(x, self.weight, self.eps)
 
 
 class GatedRMSNorm(nn.Module):
@@ -83,11 +83,7 @@ class GatedRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x, gate):
-        dtype = x.dtype
-        y = x.float()
-        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        y = self.weight * y.to(dtype)
-        return (y * F.silu(gate.float())).to(dtype)
+        return gated_rms_norm(x, gate, self.weight, self.eps)
 
 
 def l2norm(x, eps=1e-6):
@@ -177,10 +173,15 @@ class DeltaNet(nn.Module):
         y = F.conv1d(torch.cat(ext).T[None], self.conv1d.weight, groups=self.conv_dim)[0].T  # j reads ext[j:j+kernel]
         return F.silu(torch.cat([y[a:a + n] for a, n in spans]))
 
+    def merge(self):
+        self.in_split = merge_linears(self, ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"], "in_proj")
+
     def forward(self, x, segments):
-        qkv, z = self.in_proj_qkv(x), self.in_proj_z(x)
-        beta = self.in_proj_b(x).sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(x).float() + self.dt_bias.float())
+        if hasattr(self, "in_proj"):
+            qkv, z, b, a = self.in_proj(x).split(self.in_split, dim=-1)
+        else:
+            qkv, z, b, a = self.in_proj_qkv(x), self.in_proj_z(x), self.in_proj_b(x), self.in_proj_a(x)
+        beta, g = delta_gates(b, a, self.A_log, self.dt_bias)
         k1, dtype = self.kernel - 1, x.dtype
         zeros_hist = qkv.new_zeros(k1, self.conv_dim)
         zeros_state = torch.zeros(self.hv, self.dk, self.dv, device=x.device, dtype=torch.float32)
@@ -264,24 +265,23 @@ class GatedAttention(nn.Module):
         self.q_norm = RMSNorm(self.d, c.rms_norm_eps)
         self.k_norm = RMSNorm(self.d, c.rms_norm_eps)
 
+    def merge(self):
+        self.qkv_split = merge_linears(self, ["q_proj", "k_proj", "v_proj"], "qkv_proj")
+
     def forward(self, x, cos, sin, segments):
         n = x.shape[0]
-        q, gate = self.q_proj(x).view(n, self.h, 2 * self.d).chunk(2, dim=-1)
+        if hasattr(self, "qkv_proj"):
+            qg, kx, vx = self.qkv_proj(x).split(self.qkv_split, dim=-1)
+        else:
+            qg, kx, vx = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q, gate = qg.reshape(n, self.h, 2 * self.d).chunk(2, dim=-1)
         q = self.q_norm(q)
-        k = self.k_norm(self.k_proj(x).view(n, self.hkv, self.d))
-        v = self.v_proj(x).view(n, self.hkv, self.d)
+        k = self.k_norm(kx.reshape(n, self.hkv, self.d))
+        v = vx.reshape(n, self.hkv, self.d)
         q, k = rotate_partial(q, cos, sin), rotate_partial(k, cos, sin)
         o = attend(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), segments, self.index)
-        o = o.transpose(0, 1).reshape(n, self.h * self.d) * torch.sigmoid(gate.reshape(n, -1))
+        o = sigmoid_gate(o.transpose(0, 1).reshape(n, self.h * self.d), gate.reshape(n, -1))
         return self.o_proj(o)
-
-
-def rotate_partial(x, cos, sin):
-    """RoPE on the first ``cos.shape[-1]`` dims of each head (rotate-half style)."""
-    r = cos.shape[-1]
-    xr, xp = x[..., :r], x[..., r:]
-    a, b = xr.chunk(2, dim=-1)
-    return torch.cat([xr * cos[:, None] + torch.cat((-b, a), dim=-1) * sin[:, None], xp], dim=-1)
 
 
 class MLP(nn.Module):
@@ -291,8 +291,13 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(c.hidden_size, c.intermediate_size, bias=False)
         self.down_proj = nn.Linear(c.intermediate_size, c.hidden_size, bias=False)
 
+    def merge(self):
+        merge_linears(self, ["gate_proj", "up_proj"], "gate_up_proj")
+
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        if hasattr(self, "gate_up_proj"):
+            return self.down_proj(swiglu(*self.gate_up_proj(x).chunk(2, dim=-1)))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Layer(nn.Module):
@@ -349,6 +354,13 @@ class Qwen35ForReads(nn.Module):
         if name.startswith("lm_head."):
             return name
         return None
+
+    def merge_projections(self):
+        """Serve-time: one matmul per group of projections that share an input."""
+        for layer in self.model.layers:
+            (layer.linear_attn if layer.kind == "linear_attention" else layer.self_attn).merge()
+            layer.mlp.merge()
+        return self
 
     def hidden(self, ids, positions, segments):
         ang = positions.float()[:, None] * self.inv_freq[None, :]

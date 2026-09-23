@@ -11,6 +11,8 @@ import torch
 from torch import nn
 
 from ..attention import attend
+from ..fused import rms_norm, swiglu
+from .common import merge_linears
 
 
 def rope_settings(config):
@@ -50,10 +52,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return self.weight * x.to(dtype)
+        return rms_norm(x, self.weight, self.eps)
 
 
 class Attention(nn.Module):
@@ -70,11 +69,16 @@ class Attention(nn.Module):
             self.k_norm = RMSNorm(head_dim, c.rms_norm_eps)
         self.qk_norm = qk_norm
 
+    def merge(self):
+        self.qkv_split = merge_linears(self, ["q_proj", "k_proj", "v_proj"], "qkv_proj")
+
     def forward(self, x, cos, sin, segments, layer):
         n = x.shape[0]
-        q = self.q_proj(x).view(n, self.h, self.d)
-        k = self.k_proj(x).view(n, self.hkv, self.d)
-        v = self.v_proj(x).view(n, self.hkv, self.d)
+        if hasattr(self, "qkv_proj"):
+            q, k, v = self.qkv_proj(x).split(self.qkv_split, dim=-1)
+        else:
+            q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q, k, v = q.reshape(n, self.h, self.d), k.reshape(n, self.hkv, self.d), v.reshape(n, self.hkv, self.d)
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
         q = rotate(q, cos[:, None], sin[:, None]).transpose(0, 1)
@@ -90,8 +94,13 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(c.hidden_size, c.intermediate_size, bias=False)
         self.down_proj = nn.Linear(c.intermediate_size, c.hidden_size, bias=False)
 
+    def merge(self):
+        merge_linears(self, ["gate_proj", "up_proj"], "gate_up_proj")
+
     def forward(self, x):
-        return self.down_proj(nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+        if hasattr(self, "gate_up_proj"):
+            return self.down_proj(swiglu(*self.gate_up_proj(x).chunk(2, dim=-1)))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Layer(nn.Module):
@@ -132,6 +141,13 @@ class LlamaForReads(nn.Module):
     @staticmethod
     def frequencies(config):
         return inv_frequencies(config, getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads)
+
+    def merge_projections(self):
+        """Serve-time: one matmul per group of projections that share an input."""
+        for layer in self.model.layers:
+            layer.self_attn.merge()
+            layer.mlp.merge()
+        return self
 
     def hidden(self, ids, positions, segments):
         """Final-normed hidden states for a packed token sequence whose
