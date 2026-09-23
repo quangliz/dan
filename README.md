@@ -8,8 +8,17 @@ with one prefill per request and no generated tokens.
 
 ## Install
 
+From source:
+
 ```bash
-uv venv && uv pip install -e '.[dev]'
+git clone https://github.com/quangliz/dan.git && cd dan
+uv venv && uv pip install -e '.[dev]'     # editable, with test/lint tools; or: pip install -e .
+```
+
+As a dependency of another project:
+
+```bash
+uv add "dan @ git+https://github.com/quangliz/dan.git"      # or: pip install "git+https://github.com/quangliz/dan.git"
 ```
 
 On NVIDIA GPUs, use a CUDA build of torch, and for Qwen3.5 also install the recurrent-layer kernels:
