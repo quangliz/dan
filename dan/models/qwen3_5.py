@@ -17,21 +17,31 @@ the recurrent state after them.
 Numerics follow Hugging Face's reference implementation (Apache-2.0); on CUDA
 the delta rule runs in flash-linear-attention's varlen kernel when installed.
 """
-from itertools import pairwise
+import os
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..attention import attend, cu_seqlens, repeat_heads
+from ..attention import Batch, attend, cu_seqlens, repeat_heads, to_device
 from ..fused import delta_gates, gated_rms_norm, rms_norm_zero_centered, rotate_partial, sigmoid_gate, swiglu
 from .common import merge_linears
 
 try:  # GPU kernels (pip install flash-linear-attention)
     import fla.ops.gated_delta_rule.chunk as fla_chunk
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule as fla_recurrent_gated_delta_rule
 except ImportError:  # pragma: no cover - CPU / not installed
-    fla_chunk = fla_chunk_gated_delta_rule = None
+    fla_chunk = fla_chunk_gated_delta_rule = fla_recurrent_gated_delta_rule = None
+
+# Calls with at most this many tokens in total use fla's fused recurrent kernel:
+# one launch, token-sequential, ~0.15 ms to call. Bigger ones use the chunked
+# kernel, parallel over tokens but ~1.2 ms of host time per call. On an L4 at
+# Qwen3.5-4B shapes their wall times cross around 1-2k tokens, but in a
+# GPU-bound forward the chunked kernel's host time is hidden and the recurrent
+# kernel's token-sequential GPU time is not, hence the lower default.
+RECURRENT_MAX_TOKENS = int(os.environ.get("DAN_RECURRENT_MAX_TOKENS", "512"))
 
 
 def _memoize_fla_chunk_indices():
@@ -123,12 +133,18 @@ def delta_rule_torch(q, k, v, g, beta, state, chunk=64):
     return out.to(dtype), state
 
 
-def delta_rule(q, k, v, g, beta, lengths, states):
+def delta_rule(q, k, v, g, beta, lengths, states, cu=None):
     """Gated delta rule over packed sequences of ``lengths`` (q etc. [N, H, D]),
     each starting from its ``states[i]`` ([S, H, Dk, Dv] fp32). Returns the
-    packed output and the final states."""
+    packed output and the final states. ``cu``: precomputed (device, host)
+    cumulative lengths."""
     if fla_chunk_gated_delta_rule is not None and q.is_cuda:
-        cu, cu_host = cu_seqlens(lengths, q.device)
+        cu, cu_host = cu or cu_seqlens(lengths, q.device)
+        if sum(lengths) <= RECURRENT_MAX_TOKENS:
+            out, final = fla_recurrent_gated_delta_rule(
+                q[None], k[None], v[None], g=g[None], beta=beta[None], initial_state=states.float(),
+                output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
+            return out[0], final
         out, final = fla_chunk_gated_delta_rule(
             q[None], k[None], v[None], g[None], beta[None], initial_state=states.float(),
             output_final_state=True, cu_seqlens=cu, cu_seqlens_cpu=cu_host, use_qk_l2norm_in_kernel=True)
@@ -161,18 +177,6 @@ class DeltaNet(nn.Module):
         self.norm = GatedRMSNorm(self.dv, c.rms_norm_eps)
         self.out_proj = nn.Linear(value_dim, c.hidden_size, bias=False)
 
-    def conv(self, x, runs):
-        """Causal depthwise conv + SiLU over packed runs. ``runs``: (history
-        [kernel-1, C], slice of x); each run's output sees only its history and
-        itself. One conv1d over the runs laid end to end with their history."""
-        ext, spans, at = [], [], 0
-        for hist, sl in runs:
-            ext += [hist, x[sl]]
-            spans.append((at, sl.stop - sl.start))
-            at += hist.shape[0] + sl.stop - sl.start
-        y = F.conv1d(torch.cat(ext).T[None], self.conv1d.weight, groups=self.conv_dim)[0].T  # j reads ext[j:j+kernel]
-        return F.silu(torch.cat([y[a:a + n] for a, n in spans]))
-
     def merge(self):
         self.in_split = merge_linears(self, ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"], "in_proj")
 
@@ -182,75 +186,116 @@ class DeltaNet(nn.Module):
         else:
             qkv, z, b, a = self.in_proj_qkv(x), self.in_proj_z(x), self.in_proj_b(x), self.in_proj_a(x)
         beta, g = delta_gates(b, a, self.A_log, self.dt_bias)
-        k1, dtype = self.kernel - 1, x.dtype
-        zeros_hist = qkv.new_zeros(k1, self.conv_dim)
-        zeros_state = torch.zeros(self.hv, self.dk, self.dv, device=x.device, dtype=torch.float32)
-        # Trunks: split at the cache boundary when a static prefix is saved.
-        trunk_runs, trunk_states, trunk_of = [], [], []
-        for si, s in enumerate(segments):
-            hist, state = s.past[self.index] if s.past else (zeros_hist, zeros_state)
-            cut = [s.start, s.start + s.save, s.start + s.trunk] if 0 < s.save < s.trunk else [s.start, s.start + s.trunk]
-            for a, b in pairwise(cut):
-                trunk_runs.append((hist, slice(a, b)))
-                trunk_states.append(state)
-                trunk_of.append(si)
-                hist, state = None, None  # the later part continues from the earlier one: filled below
-        out = torch.empty(x.shape[0], self.hv, self.dv, device=x.device, dtype=dtype)
-        # Run trunk parts in order: a second part needs the first part's final state and conv tail.
-        tails, finals = {}, {}
-        for part in range(2):
-            idx = [i for i, (h, _) in enumerate(trunk_runs) if (h is None) == bool(part)]
-            if not idx:
-                continue
-            runs = []
-            for i in idx:
-                h, sl = trunk_runs[i]
-                if h is None:
-                    prev = i - 1
-                    h = tails[prev]
-                    trunk_states[i] = finals[prev]
-                runs.append((h, sl))
-            conv = self.conv(qkv, runs)
-            lens = [sl.stop - sl.start for _, sl in runs]
-            o, f = self._rule(conv, beta, g, runs, lens, torch.stack([trunk_states[i] for i in idx]))
-            at = 0
-            for j, (i, (h, sl), n) in enumerate(zip(idx, runs, lens)):
-                out[sl] = o[at:at + n]
-                at += n
-                tails[i] = torch.cat([h, qkv[sl]])[-k1:]
-                finals[i] = f[j]
-        # Cache entries and each segment's trunk end state.
-        seg_tail, seg_final = {}, {}
-        for i, si in enumerate(trunk_of):
-            s = segments[si]
-            seg_tail[si], seg_final[si] = tails[i], finals[i]  # the last part wins
-            if s.save and trunk_runs[i][1].stop == s.start + s.save:
-                s.saved[self.index] = (tails[i].clone(), finals[i].clone())
-        # Branches: every branch starts from its segment's trunk end.
-        runs, states = [], []
-        for si, s in enumerate(segments):
-            for a, b in s.branches:
-                runs.append((seg_tail[si], slice(a, b)))
-                states.append(seg_final[si])
-        if runs:
-            conv = self.conv(qkv, runs)
-            lens = [sl.stop - sl.start for _, sl in runs]
-            o, _ = self._rule(conv, beta, g, runs, lens, torch.stack(states))
-            at = 0
-            for (_, sl), n in zip(runs, lens):
-                out[sl] = o[at:at + n]
-                at += n
+        k1 = self.kernel - 1
+        lay = getattr(segments, "recurrent", None)
+        if lay is None or lay.rows != x.shape[0]:
+            lay = RecurrentLayout.build(segments, k1, x.shape[0], x.device)
+            if isinstance(segments, Batch):  # every DeltaNet layer of this forward shares it
+                segments.recurrent = lay
+        # Gather source: the packed rows, one zero row, then each cached conv history.
+        extra = [qkv.new_zeros(1, self.conv_dim)] + [segments[i].past[self.index][0] for i in lay.past_segments]
+        src = torch.cat([qkv, *extra])
+        zeros = torch.zeros(self.hv, self.dk, self.dv, device=x.device, dtype=torch.float32)
+        init = torch.stack([s.past[self.index][1].float() if s.past else zeros for s in segments])
+        out = torch.empty(x.shape[0], self.hv, self.dv, device=x.device, dtype=x.dtype)
+        final = self._phase(lay.trunk1, src, beta, g, init, out)
+        if lay.trunk2 is not None:
+            f2 = self._phase(lay.trunk2, src, beta, g, final.index_select(0, lay.split_segments), out)
+            final_end = final.index_copy(0, lay.split_segments, f2)
+        else:
+            final_end = final
+        for i, tail in lay.saves:  # prefix-cache entries at each save boundary
+            segments[i].saved[self.index] = (src.index_select(0, tail), final[i].clone())
+        if lay.branches is not None:
+            self._phase(lay.branches, src, beta, g, final_end.index_select(0, lay.branch_segment), out)
         y = self.norm(out.reshape(-1, self.dv), z.reshape(-1, self.dv)).reshape(x.shape[0], -1)
         return self.out_proj(y)
 
-    def _rule(self, conv, beta, g, runs, lens, states):
+    def _phase(self, ph, src, beta, g, states, out):
+        """One batch of runs: causal conv over [history; run] (a gather), then
+        the delta rule from ``states``; writes the runs' rows of ``out`` and
+        returns their final states."""
+        ext = src.index_select(0, ph.ext)
+        y = F.conv1d(ext.T[None], self.conv1d.weight, groups=self.conv_dim)[0].T  # row j reads ext[j:j+kernel]
+        conv = F.silu(y.index_select(0, ph.take))
         key_dim = self.hk * self.dk
         q, k, v = conv.split([key_dim, key_dim, self.hv * self.dv], dim=-1)
         n = conv.shape[0]
         q, k, v = q.reshape(n, self.hk, self.dk), k.reshape(n, self.hk, self.dk), v.reshape(n, self.hv, self.dv)
         q, k = repeat_heads(q, self.hv // self.hk), repeat_heads(k, self.hv // self.hk)
-        rows = torch.cat([torch.arange(sl.start, sl.stop, device=conv.device) for _, sl in runs])
-        return delta_rule(q, k, v, g[rows], beta[rows], lens, states)
+        o, f = delta_rule(q, k, v, g.index_select(0, ph.rows), beta.index_select(0, ph.rows), ph.lens, states, ph.cu)
+        out.index_copy_(0, ph.rows, o)
+        return f
+
+
+@dataclass
+class Phase:
+    ext: torch.Tensor  # gather rows (from the conv source) of every run's [history; tokens]
+    take: torch.Tensor  # conv output rows that belong to run tokens
+    rows: torch.Tensor  # packed rows of the run tokens, in run order
+    lens: list
+    cu: tuple  # cumulative run lengths (device, host)
+
+
+@dataclass
+class RecurrentLayout:
+    """Gather indices for the recurrent layers, built once per forward.
+
+    Each segment has a virtual sequence: ``kernel - 1`` history rows (zeros,
+    or its cached conv history) followed by its trunk rows. Runs: trunk part 1
+    (up to the prefix-cache boundary, when one is being saved), trunk part 2
+    (the rest), and every branch (whose history is the trunk's last rows)."""
+
+    rows: int
+    trunk1: Phase
+    trunk2: Phase | None
+    branches: Phase | None
+    split_segments: torch.Tensor | None  # segments whose trunk is in two parts
+    branch_segment: torch.Tensor | None  # segment of each branch
+    past_segments: list  # segments with a cached conv history, in source order
+    saves: list  # (segment, gather rows of its conv tail at the save boundary)
+
+    @classmethod
+    def build(cls, segments, k1, n_rows, device):
+        zero = n_rows
+        past_segments = [i for i, s in enumerate(segments) if s.past]
+        virtual = []
+        for i, s in enumerate(segments):
+            if s.past:
+                base = n_rows + 1 + k1 * past_segments.index(i)
+                hist = list(range(base, base + k1))
+            else:
+                hist = [zero] * k1
+            virtual.append(hist + list(range(s.start, s.start + s.trunk)))
+
+        def phase(runs):  # runs: (history rows, token rows)
+            if not runs:
+                return None
+            ext, take, rows, lens, at = [], [], [], [], 0
+            for hist, toks in runs:
+                ext += hist + toks
+                take += range(at, at + len(toks))
+                rows += toks
+                lens.append(len(toks))
+                at += len(hist) + len(toks)
+            return Phase(to_device(ext, device), to_device(take, device), to_device(rows, device), lens,
+                         cu_seqlens(lens, device))
+
+        t1, t2, split, saves, br, br_seg = [], [], [], [], [], []
+        for i, s in enumerate(segments):
+            v = virtual[i]
+            cut = s.save if 0 < s.save < s.trunk else s.trunk
+            t1.append((v[:k1], v[k1:k1 + cut]))
+            if cut < s.trunk:
+                t2.append((v[cut:k1 + cut], v[k1 + cut:]))
+                split.append(i)
+            if s.save:
+                saves.append((i, torch.tensor(v[cut:k1 + cut], dtype=torch.long, device=device)))
+            for a, b in s.branches:
+                br.append((v[-k1:], list(range(a, b))))
+                br_seg.append(i)
+        return cls(n_rows, phase(t1), phase(t2), phase(br), to_device(split, device) if split else None,
+                   to_device(br_seg, device) if br_seg else None, past_segments, saves)
 
 
 class GatedAttention(nn.Module):

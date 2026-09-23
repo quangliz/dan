@@ -96,10 +96,19 @@ class Segment:
 
 
 class Batch(list):
-    """The segments of one packed forward; caches their varlen layout, which
-    is the same for every attention layer."""
+    """The segments of one packed forward; caches the index layouts that every
+    attention layer (``layout``) and recurrent layer (``recurrent``) shares."""
 
     layout = None
+    recurrent = None
+
+
+def to_device(xs, device):
+    """A host list of indices as a long tensor on ``device`` (pinned, non-blocking upload on CUDA)."""
+    t = torch.tensor(xs, dtype=torch.long)
+    if torch.device(device).type == "cuda":
+        return t.pin_memory().to(device, non_blocking=True)
+    return t.to(device)
 
 
 def segment(start, branch, past=None, save=0, past_len=0, device="cpu"):
@@ -155,11 +164,8 @@ class ReadLayout:
             bq.append(s.end - s.start - s.trunk)
             bl += [b - a for a, b in s.branches]
 
-        def idx(rows):
-            return torch.tensor(rows, dtype=torch.long).pin_memory().to(device, non_blocking=True)
-
         i32 = torch.int32
-        return cls(idx(trunk_rows), idx(branch_rows),
+        return cls(to_device(trunk_rows, device), to_device(branch_rows, device),
                    cu_seqlens(tq, device, i32)[0], cu_seqlens(tk, device, i32)[0], max(tq), max(tk),
                    cu_seqlens(bq, device, i32)[0], max(bq),
                    cu_seqlens(bl, device, i32)[0] if bl else None, max(bl, default=0),

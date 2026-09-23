@@ -3,7 +3,8 @@
 Each is a pure function over a few tensors (norms, gates, activations, FP8
 activation scaling). Eager they are several passes over memory each; compiled
 they become one kernel. Compilation is lazy, shape-dynamic (token counts vary
-per batch) and CUDA-only; CPU runs them eagerly. Set DAN_COMPILE=0 to disable.
+per batch) and CUDA-only, and small inputs (fewer than DAN_COMPILE_MIN_ROWS
+rows) skip it; CPU runs them eagerly. Set DAN_COMPILE=0 to disable.
 """
 import os
 
@@ -11,6 +12,9 @@ import torch
 import torch.nn.functional as F
 
 ENABLED = os.environ.get("DAN_COMPILE", "1") != "0"
+# Below this many rows a compiled call's host overhead (~100-250 us: guard
+# checks, graph call) costs more than running the few ops eagerly.
+MIN_ROWS = int(os.environ.get("DAN_COMPILE_MIN_ROWS", "512"))
 
 
 def fused(fn):
@@ -18,7 +22,7 @@ def fused(fn):
 
     def run(*args):
         nonlocal compiled
-        if ENABLED and args[0].is_cuda:
+        if ENABLED and args[0].is_cuda and args[0].shape[0] >= MIN_ROWS:
             if compiled is None:
                 compiled = torch.compile(fn, dynamic=True, fullgraph=True)
             return compiled(*args)
