@@ -4,9 +4,10 @@ import os
 
 import torch
 
-from .llama import LlamaForReads, inv_frequencies
+from .llama import LlamaForReads
+from .qwen3_5 import Qwen35ForReads
 
-ARCHS = [LlamaForReads]
+ARCHS = [LlamaForReads, Qwen35ForReads]
 
 
 def load(name, device="cpu", dtype=torch.float32):
@@ -21,18 +22,21 @@ def load(name, device="cpu", dtype=torch.float32):
     path = name if os.path.isdir(name) else snapshot_download(name, allow_patterns=["*.json", "*.safetensors"])
     with torch.device("meta"):
         model = cls(config)
+    remap = getattr(cls, "remap", lambda k: k)
     state = {}
     for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
-        state.update(load_file(f))
-    tied = getattr(config, "tie_word_embeddings", False)
+        for k, v in load_file(f).items():
+            k = remap(k)
+            if k is not None:
+                state[k] = v
+    tied = model.lm_head.weight is model.model.embed_tokens.weight
     if tied:
-        state.pop("lm_head.weight", None)
         state["lm_head.weight"] = state["model.embed_tokens.weight"]
     model.load_state_dict(state, strict=True, assign=True)
     if tied:
         model.lm_head.weight = model.model.embed_tokens.weight
     # RoPE frequencies were built on the meta device; rebuild them and keep them fp32
-    inv_freq = inv_frequencies(config, model.inv_freq.shape[0] * 2)
+    inv_freq = cls.frequencies(model.config)
     model.inv_freq = inv_freq
     model = model.to(device=device, dtype=dtype).eval()
     model.inv_freq = inv_freq.to(device)

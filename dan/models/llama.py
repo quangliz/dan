@@ -129,6 +129,10 @@ class LlamaForReads(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
         self.register_buffer("inv_freq", inv_frequencies(config, head_dim), persistent=False)
 
+    @staticmethod
+    def frequencies(config):
+        return inv_frequencies(config, getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads)
+
     def hidden(self, ids, positions, segments):
         """Final-normed hidden states for a packed token sequence whose
         requests are ``segments`` (see ``attention.Segment``)."""

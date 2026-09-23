@@ -46,7 +46,7 @@ class Runner:
                 branch += [j] * len(b.suffix)
                 reads.append((len(ids) - 1, b.label_ids))
             save = plan.static if use_cache and static and not past else 0
-            segs.append(segment(start, torch.tensor(branch, device=self.device), past, save))
+            segs.append(segment(start, torch.tensor(branch, device=self.device), past, save, skip))
             if save:
                 stores.append((static, segs[-1]))
         t = lambda xs: torch.tensor(xs, dtype=torch.long, device=self.device)

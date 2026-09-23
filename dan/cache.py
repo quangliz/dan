@@ -12,7 +12,7 @@ class PrefixCache:
     def __init__(self, max_bytes=2 << 30):
         self.max_bytes = max_bytes
         self.used = 0
-        self.entries = OrderedDict()  # tuple(ids) -> (per-layer [(k, v)], bytes)
+        self.entries = OrderedDict()  # tuple(ids) -> ({layer: (tensor, tensor)}, bytes)
         self.hits = self.misses = 0
 
     def get(self, ids):
@@ -29,7 +29,7 @@ class PrefixCache:
         key = tuple(ids)
         if key in self.entries:
             return
-        size = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in kv)
+        size = sum(t.numel() * t.element_size() for pair in kv.values() for t in pair)
         if size > self.max_bytes:
             return
         while self.used + size > self.max_bytes:
