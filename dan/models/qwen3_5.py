@@ -372,4 +372,4 @@ class Qwen35ForReads(nn.Module):
         return self.model.norm(x)
 
     def label_logits(self, h, label_ids):
-        return self.lm_head.weight[label_ids] @ h
+        return self.lm_head.weight[label_ids].float() @ h.float()  # fp32: bf16 logits step by 0.06+

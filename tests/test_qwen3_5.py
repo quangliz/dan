@@ -28,3 +28,25 @@ def test_hybrid_parity_with_reference(hybrid, device):
             for a, b in zip(logits, want):
                 torch.testing.assert_close(a, b, atol=5e-3, rtol=1e-3)
     assert runner.cache.hits >= len(plans)
+
+
+def test_hybrid_varlen_matches_dense_bf16(hybrid, monkeypatch):
+    """bf16 on CUDA: the varlen attention path gives the dense path's answers."""
+    import pytest
+
+    from dan import attention as A
+
+    if not torch.cuda.is_available() or A.varlen_attn is None:
+        pytest.skip("needs CUDA and varlen attention")
+    planner = Planner(AutoTokenizer.from_pretrained(hybrid))
+    plans = [planner.plan(s, dict(QUESTIONS, **EXTRA)) for s in STATES]
+    runner = Runner(hybrid, "cuda", torch.bfloat16)
+    fast = [runner.read_many(plans), runner.read_many(plans)]  # cold, then warm (cached prefixes)
+    monkeypatch.setattr(A, "VARLEN", False)
+    runner.cache.entries.clear()
+    dense = runner.read_many(plans)
+    for got in fast:
+        for a_plan, b_plan in zip(got, dense):
+            for a, b in zip(a_plan, b_plan):
+                pa, pb = torch.softmax(a, 0), torch.softmax(b, 0)
+                assert (pa - pb).abs().max() < 3e-2

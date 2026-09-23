@@ -162,4 +162,4 @@ class LlamaForReads(nn.Module):
 
     def label_logits(self, h, label_ids):
         """Logits of just ``label_ids`` for one hidden state."""
-        return self.lm_head.weight[label_ids] @ h
+        return self.lm_head.weight[label_ids].float() @ h.float()  # fp32: bf16 logits step by 0.06+

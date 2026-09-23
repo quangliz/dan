@@ -1,15 +1,15 @@
 """Packed, prefill-only reads on dan's own model code.
 
 Any number of read plans run in one forward pass: each plan contributes its
-prompt (trunk) followed by one branch per question; attention runs per plan
-under a tree mask (see ``attention``). Branch positions continue from the end
+prompt (trunk) followed by one branch per question, and attention keeps
+questions apart (see ``attention``). Branch positions continue from the end
 of their trunk, so every question sees the positions it would in a separate
 forward. A plan whose static prefix is cached starts from its keys and values
 and computes only the rest of its prompt.
 """
 import torch
 
-from .attention import segment
+from .attention import Batch, segment
 from .cache import PrefixCache
 from .models import load
 
@@ -38,7 +38,7 @@ class Runner:
     def pack(self, plans, use_cache=True):
         """Flat ids and positions, one segment per plan with questions, the
         read positions with their label ids, and the static prefixes to store."""
-        ids, pos, segs, reads, stores = [], [], [], [], []
+        ids, pos, segs, reads, stores = [], [], Batch(), [], []
         use_cache = use_cache and self.cache is not None
         for plan in plans:
             if not plan.branches:

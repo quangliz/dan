@@ -85,3 +85,13 @@ def fp8_quantize(x, fp8_max, rowwise: bool):
     amax = xf.abs().amax(dim=-1, keepdim=True) if rowwise else xf.abs().amax().reshape(1, 1)
     scale = amax.clamp(min=1e-12) / fp8_max
     return (xf / scale).to(torch.float8_e4m3fn), scale
+
+
+@fused
+def lse_merge(o_a, lse_a, o_b, lse_b):
+    """Combine two attention results over disjoint key sets into the result
+    over their union, from each part's log-sum-exp. o: [T, H, D]; lse: [H, T]."""
+    la, lb = lse_a.float().t()[..., None], lse_b.float().t()[..., None]
+    m = torch.maximum(la, lb)
+    wa, wb = (la - m).exp(), (lb - m).exp()
+    return ((o_a.float() * wa + o_b.float() * wb) / (wa + wb)).to(o_a.dtype)
