@@ -35,11 +35,21 @@ def tree_mask(branch):
     return causal & ((branch[None, :] == 0) | (branch[None, :] == branch[:, None]))
 
 
+def branch_rows_mask(branch, trunk):
+    """The tree mask's rows for branch tokens only, [N - trunk, N]: each sees
+    the whole trunk and its own branch up to itself (== tree_mask(branch)[trunk:])."""
+    n = branch.shape[0]
+    cols = torch.arange(n, device=branch.device)
+    rows = cols[trunk:]
+    own = (branch[None, :] == branch[trunk:, None]) & (cols[None, :] <= rows[:, None])
+    return (cols[None, :] < trunk) | own
+
+
 @dataclass
 class Segment:
     start: int  # this request's new tokens are packed[start:end]
     end: int
-    mask: torch.Tensor  # [n, past + n]
+    mask: torch.Tensor  # branch rows only: [n - trunk, past + n]
     trunk: int = 0  # new trunk tokens: packed[start:start + trunk]
     branches: list = field(default_factory=list)  # (start, end) of each branch in the packed sequence
     past: dict | None = None  # layer -> cache entry, e.g. (k, v) each [Hkv, past, D]
@@ -50,10 +60,12 @@ class Segment:
 def segment(start, branch, past=None, save=0, past_len=0, device="cpu"):
     """A segment over new tokens with ``branch`` ids (a list: trunk first, then
     each branch contiguous), after ``past_len`` cached tokens."""
-    mask = tree_mask(torch.tensor(branch, device=device))
+    trunk = next((i for i, b in enumerate(branch) if b), len(branch))
+    # Only branch rows need a mask (the trunk is plain causal): [branches, past + n]
+    # instead of [n, n], which for a long prompt would not fit in memory.
+    mask = branch_rows_mask(torch.tensor(branch, device=device), trunk)
     if past:
         mask = torch.cat([mask.new_ones(mask.shape[0], past_len), mask], dim=1)
-    trunk = next((i for i, b in enumerate(branch) if b), len(branch))
     spans, i = [], trunk
     while i < len(branch):
         j = i
@@ -92,7 +104,7 @@ def attend(q, k, v, segments, layer, scale=None):
         if s.end > mid:
             kb, vb = repeat_heads(ks.transpose(0, 1), rep).transpose(0, 1), repeat_heads(vs.transpose(0, 1), rep).transpose(0, 1)
             out[:, mid:s.end] = F.scaled_dot_product_attention(
-                q[None, :, mid:s.end], kb[None], vb[None], attn_mask=s.mask[None, None, t:], scale=scale)[0]
+                q[None, :, mid:s.end], kb[None], vb[None], attn_mask=s.mask[None, None], scale=scale)[0]
     return out
 
 

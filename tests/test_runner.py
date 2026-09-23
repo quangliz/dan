@@ -4,7 +4,7 @@ import torch
 from test_prompt_llm import QUESTIONS
 from transformers import AutoTokenizer
 
-from dan.attention import tree_mask
+from dan.attention import branch_rows_mask, tree_mask
 from dan.prompt import Planner
 from dan.reference import HFReference
 from dan.runner import Runner
@@ -18,6 +18,8 @@ def test_tree_mask():
     assert m[1].tolist() == [True, True, False, False, False]
     assert m[3].tolist() == [True, True, True, True, False]
     assert m[4].tolist() == [True, True, False, False, True]
+    b = torch.tensor([0, 0, 0, 1, 1, 2, 3, 3])
+    assert torch.equal(branch_rows_mask(b, 3), tree_mask(b)[3:])
 
 
 @pytest.mark.parametrize("model", ["tiny", "small"])
